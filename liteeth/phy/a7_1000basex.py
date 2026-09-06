@@ -9,6 +9,7 @@
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
 from migen.genlib.cdc import PulseSynchronizer
+from math import ceil
 
 from litex.gen import *
 
@@ -46,6 +47,9 @@ class A7_1000BASEX(LiteXModule):
 
         # Platform (required for BASE-R RTL sources).
         platform       = None,
+
+        # QPLL reference frequency
+        refclk_freq    = None,
     ):
         baser = self.baser
 
@@ -82,6 +86,10 @@ class A7_1000BASEX(LiteXModule):
             # adds a fixed one-block latency.
             tx_xgmii_data = Signal(64, reset=0x0707070707070707)
             tx_xgmii_ctl  = Signal(8,  reset=0xff)
+            # Tagged for the timing exceptions below: these advance on the same edges as the
+            # gated PCS clock, so their paths into the PCS get two cycles.
+            tx_xgmii_data.attr.add(("pcs_block_reg", "true"))
+            tx_xgmii_ctl.attr.add(("pcs_block_reg", "true"))
             self.sync.eth_tx += If(tx_block_ce,
                 tx_xgmii_data.eq(xgmii_pads.tx_data),
                 tx_xgmii_ctl.eq(xgmii_pads.tx_ctl),
@@ -119,13 +127,13 @@ class A7_1000BASEX(LiteXModule):
             self.specials += [
                 Instance("BUFGCE",
                     p_SIM_DEVICE = "7SERIES",
-                    i_I          = self.txoutclk,
+                    i_I          = self.cd_eth_tx.clk,
                     i_CE         = tx_block_ce | ResetSignal("eth_tx"),
                     o_O          = tx_pcs_clk,
                 ),
                 Instance("BUFGCE",
                     p_SIM_DEVICE = "7SERIES",
-                    i_I          = self.rxoutclk,
+                    i_I          = self.cd_eth_rx.clk,
                     i_CE         = rx_block_ce | ResetSignal("eth_rx"),
                     o_O          = rx_pcs_clk,
                 ),
@@ -134,7 +142,7 @@ class A7_1000BASEX(LiteXModule):
             # shortest interval (two raw clock cycles).  The TX XGMII state is
             # clock-enabled only on block boundaries, so its path to the PCS
             # consumes the following generated-clock edge.
-            raw_clk_period = f"{1e9/(self.linerate/32):.3f}"
+            raw_clk_period = f"{1e9/(self.linerate/16):.3f}"
             platform.add_platform_command(
                 "create_clock -name {txoutclk} -period " + raw_clk_period +
                 " [get_nets {txoutclk}]",
@@ -145,41 +153,44 @@ class A7_1000BASEX(LiteXModule):
                 " [get_nets {rxoutclk}]",
                 rxoutclk = self.rxoutclk,
             )
-            platform.add_platform_command(
-                "create_generated_clock -name {tx_pcs_clk} -divide_by 2 "
-                "-source [get_pins -of_objects [get_nets {txoutclk}] "
-                "-filter {{REF_PIN_NAME == TXOUTCLK}}] [get_nets {tx_pcs_clk}]",
-                txoutclk   = self.txoutclk,
-                tx_pcs_clk = tx_pcs_clk,
-            )
-            platform.add_platform_command(
-                "create_generated_clock -name {rx_pcs_clk} -divide_by 2 "
-                "-source [get_pins -of_objects [get_nets {rxoutclk}] "
-                "-filter {{REF_PIN_NAME == RXOUTCLK}}] [get_nets {rx_pcs_clk}]",
-                rxoutclk   = self.rxoutclk,
-                rx_pcs_clk = rx_pcs_clk,
-            )
-            platform.add_platform_command(
-                "set_multicycle_path 2 -setup "
-                "-from [get_clocks -of_objects [get_nets {tx_clk}]] "
-                "-to [get_clocks {tx_pcs_clk}]",
-                tx_clk     = self.cd_eth_tx.clk,
-                tx_pcs_clk = tx_pcs_clk,
-            )
-            platform.add_platform_command(
-                "set_false_path -hold "
-                "-from [get_clocks -of_objects [get_nets {tx_clk}]] "
-                "-to [get_clocks {tx_pcs_clk}]",
-                tx_clk     = self.cd_eth_tx.clk,
-                tx_pcs_clk = tx_pcs_clk,
-            )
-            platform.add_platform_command(
-                "set_false_path -hold "
-                "-from [get_clocks -of_objects [get_nets {rx_clk}]] "
-                "-to [get_clocks {rx_pcs_clk}]",
-                rx_clk     = self.cd_eth_rx.clk,
-                rx_pcs_clk = rx_pcs_clk,
-            )
+
+            # Timing exceptions for the gated PCS clocks. Two classes of path get two cycles,
+            # because both ends advance on the same block enable: PCS -> PCS, and the
+            # pcs_block_reg-tagged registers -> TX PCS. Everything else (PCS -> GT TXDATA, GT
+            # RXDATA -> PCS, the pairing registers -> PCS, PCS -> the CE-gated XGMII adapters) is
+            # a real one-cycle path and must not be relaxed.
+            _pcs_cells = {
+                d: '[get_cells -hierarchical -filter "NAME =~ *eth_phy_10g_%s/* && IS_SEQUENTIAL"]' % d
+                for d in ("tx", "rx")
+            }
+            _blk_cells = '[get_cells -hierarchical -filter "pcs_block_reg == TRUE"]'
+            for _from, _to in ((_pcs_cells["tx"], _pcs_cells["tx"]),
+                               (_pcs_cells["rx"], _pcs_cells["rx"]),
+                               (_blk_cells,       _pcs_cells["tx"])):
+                platform.toolchain.pre_placement_commands.add(
+                    "set_multicycle_path 2 -setup -from " + _from + " -to " + _to)
+                platform.toolchain.pre_placement_commands.add(
+                    "set_multicycle_path 1 -hold -from " + _from + " -to " + _to)
+
+            # UG482: RXGEARBOXSLIP must be pulsed for one RXUSRCLK2 cycle and then held low for
+            # at least 32 cycles while the gearbox re-aligns. The PCS requests a slip on every
+            # block it cannot frame, so rate-limit it (as the K7 GTX PHY does).
+            SLIP_HOLDOFF  = 64
+            rx_slip_d     = Signal()
+            rx_slip_wait  = Signal(max=SLIP_HOLDOFF + 1)
+            rx_slip_pulse = Signal()
+            self.sync.eth_rx += [
+                rx_slip_d.eq(pcs.serdes_rx_slip),
+                If(rx_slip_wait != 0,
+                    rx_slip_wait.eq(rx_slip_wait - 1),
+                ).Elif(pcs.serdes_rx_slip & ~rx_slip_d,
+                    rx_slip_wait.eq(SLIP_HOLDOFF),
+                ),
+            ]
+            # Registered so the GT pin sees an eth_rx flop; still one cycle wide since
+            # rx_slip_wait is non-zero on the next cycle.
+            self.sync.eth_rx += rx_slip_pulse.eq(
+                (rx_slip_wait == 0) & pcs.serdes_rx_slip & ~rx_slip_d)
 
             self.link_up                 = pcs.rx_status
             self.integrated_ifg_inserter = True
@@ -246,56 +257,68 @@ class A7_1000BASEX(LiteXModule):
             tx_sequence      = Signal(7)
             tx_gearbox_ready = Signal()
             tx_half          = Signal()
-            self.tx_sequence      = tx_sequence
-            self.tx_gearbox_ready = tx_gearbox_ready
-            self.tx_block_ce      = tx_block_ce
             self.sync.eth_tx += [
                 If(tx_sequence == 32,
                     tx_sequence.eq(0),
                 ).Else(
                     tx_sequence.eq(tx_sequence + 1),
                 ),
-                If(tx_gearbox_ready,
-                    tx_half.eq(~tx_half),
-                ),
             ]
             self.comb += [
+                # UG482 Table 3-10: with a 32-bit TX_DATA_WIDTH the TXSEQUENCE pause is at 31
+                # (the counter still runs 0..32), so block 15 straddles it: low word at 30, high
+                # word at 32.
+                tx_gearbox_ready.eq(tx_sequence != 31),
+                tx_half.eq(tx_sequence[0] | (tx_sequence == 32)),
                 tx_block_ce.eq(tx_gearbox_ready & tx_half),
-                tx_data.eq(Mux(tx_half, pcs.serdes_tx_data[32:], pcs.serdes_tx_data[:32])),
+                # On the GTP 4-byte gearbox interface the word presented with the header is
+                # block bits [63:32] and the following word is [31:0]. Loopback cannot show this
+                # (any self-consistent order works); a real peer can.
+                tx_data.eq(Mux(tx_half, pcs.serdes_tx_data[:32], pcs.serdes_tx_data[32:])),
                 tx_header.eq(Cat(pcs.serdes_tx_hdr, 0)),
             ]
 
             # RXDATAVALID identifies the 32-bit payload words emitted by the
-            # native gearbox.  Reassemble pairs before advancing the PCS.
+            # native gearbox. Reassemble pairs before advancing the PCS.
+            rx_data_gt         = Signal(32)
+            rx_data_valid_gt   = Signal(2)
+            rx_header_gt       = Signal(3)
+            rx_header_valid_gt = Signal()
             rx_data_valid   = Signal(2)
             rx_header       = Signal(3)
             rx_header_valid = Signal()
+            self.sync.eth_rx += [
+                rx_data.eq(rx_data_gt),
+                rx_data_valid.eq(rx_data_valid_gt),
+                rx_header.eq(rx_header_gt),
+                rx_header_valid.eq(rx_header_valid_gt),
+            ]
             rx_data_low     = Signal(32)
             rx_header_latch = Signal(2)
-            rx_half         = Signal()
+            rx_have_low     = Signal()
             rx_block_data   = Signal(64)
             rx_block_header = Signal(2)
-            self.rx_data_valid   = rx_data_valid
-            self.rx_header_valid = rx_header_valid
-            self.rx_block_ce     = rx_block_ce
             self.sync.eth_rx += [
                 If(rx_data_valid[0],
-                    If(~rx_half,
+                    If(rx_header_valid,
                         rx_data_low.eq(rx_data),
+                        rx_header_latch.eq(rx_header[:2]),
+                        rx_have_low.eq(1),
+                    ).Elif(rx_have_low,
+                        rx_have_low.eq(0),
                     ),
-                    rx_half.eq(~rx_half),
-                ),
-                If(rx_header_valid,
-                    rx_header_latch.eq(rx_header[:2]),
                 ),
             ]
             self.comb += [
-                rx_block_ce.eq(rx_data_valid[0] & rx_half),
-                rx_block_data.eq(Cat(rx_data_low, rx_data)),
-                rx_block_header.eq(Mux(rx_header_valid, rx_header[:2], rx_header_latch)),
+                rx_block_ce.eq(rx_data_valid[0] & ~rx_header_valid & rx_have_low),
+                # Header word = block bits [63:32], following word = [31:0] (see TX).
+                rx_block_data.eq(Cat(rx_data, rx_data_low)),
+                rx_block_header.eq(rx_header_latch),
                 pcs.serdes_rx_data.eq(rx_block_data),
                 pcs.serdes_rx_hdr.eq(rx_block_header),
             ]
+
+        clk25_div = 5 if refclk_freq is None else ceil(refclk_freq/25e6)
 
         # Work around Python's 255 argument limitation.
         self.gtp_params = gtp_params = dict(
@@ -394,8 +417,8 @@ class A7_1000BASEX(LiteXModule):
             p_TERM_RCAL_CFG              = 0b100001000010000,
             p_TERM_RCAL_OVRD             = 0b000,
             p_TST_RSV                    = 0x00000000,
-            p_RX_CLK25_DIV               = 5,
-            p_TX_CLK25_DIV               = 5,
+            p_RX_CLK25_DIV               = clk25_div,
+            p_TX_CLK25_DIV               = clk25_div,
             p_UCODEER_CLR                = 0b0,
 
             # PCI Express Attributes
@@ -678,9 +701,9 @@ class A7_1000BASEX(LiteXModule):
             # Receive Ports - FPGA RX Interface Datapath Configuration
             i_RX8B10BEN            = 0,
             # Receive Ports - FPGA RX Interface Ports
-            o_RXDATA               = rx_data if baser else Cat(rx_data[:8], rx_data[10:18]),
-            i_RXUSRCLK             = ClockSignal("eth_rx") if baser else ClockSignal("eth_rx_half"),
-            i_RXUSRCLK2            = ClockSignal("eth_rx") if baser else ClockSignal("eth_rx_half"),
+            o_RXDATA               = rx_data_gt if baser else Cat(rx_data[:8], rx_data[10:18]),
+            i_RXUSRCLK             = ClockSignal("eth_rx_usr") if baser else ClockSignal("eth_rx_half"),
+            i_RXUSRCLK2            = ClockSignal("eth_rx")     if baser else ClockSignal("eth_rx_half"),
             # Receive Ports - Pattern Checker Ports
             o_RXPRBSERR            = Open(),
             i_RXPRBSSEL            = 0,
@@ -766,11 +789,11 @@ class A7_1000BASEX(LiteXModule):
             o_RXOUTCLKPCS          = Open(),
             i_RXOUTCLKSEL          = 0b010,
             # Receive Ports - RX Gearbox Ports
-            o_RXDATAVALID          = rx_data_valid if baser else Open(),
-            o_RXHEADER             = rx_header if baser else Open(),
-            o_RXHEADERVALID        = rx_header_valid if baser else Open(),
+            o_RXDATAVALID          = rx_data_valid_gt if baser else Open(),
+            o_RXHEADER             = rx_header_gt if baser else Open(),
+            o_RXHEADERVALID        = rx_header_valid_gt if baser else Open(),
             o_RXSTARTOFSEQ         = Open(),
-            i_RXGEARBOXSLIP        = (pcs.serdes_rx_slip & rx_block_ce) if baser else 0,
+            i_RXGEARBOXSLIP        = rx_slip_pulse if baser else 0,
             # Receive Ports - RX Initialization and Reset Ports
             i_GTRXRESET            = rx_reset,
             i_RXLPMRESET           = 0,
@@ -817,8 +840,8 @@ class A7_1000BASEX(LiteXModule):
             i_PMARSVDIN1           = 0b0,
             # Transmit Ports - FPGA TX Interface Ports
             i_TXDATA               = tx_data if baser else Cat(tx_data[:8], tx_data[10:18]),
-            i_TXUSRCLK             = ClockSignal("eth_tx") if baser else ClockSignal("eth_tx_half"),
-            i_TXUSRCLK2            = ClockSignal("eth_tx") if baser else ClockSignal("eth_tx_half"),
+            i_TXUSRCLK             = ClockSignal("eth_tx_usr") if baser else ClockSignal("eth_tx_half"),
+            i_TXUSRCLK2            = ClockSignal("eth_tx")     if baser else ClockSignal("eth_tx_half"),
             # Transmit Ports - PCI Express Ports
             i_TXELECIDLE           = 0,
             i_TXMARGIN             = 0,
@@ -872,7 +895,7 @@ class A7_1000BASEX(LiteXModule):
             i_TXOUTCLKSEL          = 0b010,
             o_TXRATEDONE           = Open(),
             # Transmit Ports - TX Gearbox Ports
-            o_TXGEARBOXREADY       = tx_gearbox_ready if baser else Open(),
+            o_TXGEARBOXREADY       = Open(),
             i_TXHEADER             = tx_header if baser else 0,
             i_TXSEQUENCE           = tx_sequence if baser else 0,
             i_TXSTARTSEQ           = 0,
@@ -919,18 +942,32 @@ class A7_1000BASEX(LiteXModule):
             raise ValueError
 
         if baser:
-            # With the 32-bit native gearbox TX/RXOUTCLK directly provide the
-            # 5.15625Gbps/32 = 161.1328125MHz user clocks.
+            # UG482: 4-byte mode needs xxUSRCLK2 = xxUSRCLK/2, with xxUSRCLK2 = linerate/32 so
+            # that 32-bit xxDATA carries the full line rate. TX/RXOUTCLK run at linerate/16, so
+            # one MMCM per direction provides both clocks, phase aligned.
+            txoutclk_rebuffer = Signal()
+            rxoutclk_rebuffer = Signal()
             self.specials += [
-                Instance("BUFG", i_I=self.txoutclk, o_O=self.cd_eth_tx.clk),
-                Instance("BUFG", i_I=self.rxoutclk, o_O=self.cd_eth_rx.clk),
-                AsyncResetSynchronizer(self.cd_eth_tx, tx_cm_reset),
-                AsyncResetSynchronizer(self.cd_eth_rx, rx_cm_reset),
+                Instance("BUFG", i_I=self.txoutclk, o_O=txoutclk_rebuffer),
+                Instance("BUFG", i_I=self.rxoutclk, o_O=rxoutclk_rebuffer),
             ]
-            self.comb += [
-                tx_cm_locked.eq(~tx_cm_reset),
-                rx_cm_locked.eq(~rx_cm_reset),
-            ]
+            self.cd_eth_tx_usr     = ClockDomain(reset_less=True)
+            self.cd_eth_rx_usr     = ClockDomain(reset_less=True)
+
+            self.tx_cm = tx_cm = S7MMCM()
+            tx_cm.register_clkin(txoutclk_rebuffer, self.tx_clk_freq*2)
+            tx_cm.create_clkout(self.cd_eth_tx_usr,     self.tx_clk_freq*2, with_reset=False)
+            tx_cm.create_clkout(self.cd_eth_tx,         self.tx_clk_freq,   with_reset=True)
+            self.comb += tx_cm.reset.eq(tx_cm_reset)
+            self.comb += tx_cm_locked.eq(tx_cm.locked)
+
+            self.rx_cm = rx_cm = S7MMCM()
+            rx_cm.register_clkin(rxoutclk_rebuffer, self.rx_clk_freq*2)
+            rx_cm.create_clkout(self.cd_eth_rx_usr,     self.rx_clk_freq*2, with_reset=False)
+            rx_cm.create_clkout(self.cd_eth_rx,         self.rx_clk_freq,   with_reset=True)
+            self.comb += rx_cm.reset.eq(rx_cm_reset)
+            self.comb += rx_cm_locked.eq(rx_cm.locked)
+
         else:
             # Get full-rate clocks back - the GTP is outputting half-rate clocks.
             txoutclk_rebuffer = Signal()
