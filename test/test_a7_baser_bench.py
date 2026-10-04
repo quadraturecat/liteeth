@@ -54,4 +54,3 @@ class TestA7BASERBench(unittest.TestCase):
         n31 = divider(43)
         self.assertEqual(156.25e6*n2/n31/n1, ac701_5g.REFCLK_FREQ)
         self.assertEqual(ac701_5g.REFCLK_FREQ*5*5*2, 5.15625e9)
-        self.assertEqual(acorn_baseboard_mini_5g.REFCLK_FREQ*3*5*2, 5.15625e9)

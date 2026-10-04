@@ -44,6 +44,7 @@ from liteeth.phy.parallel.rgmii.agilex import LiteEthPHYRGMII as LiteEthAgilexPH
 
 from liteeth.phy.serial.basex.wrappers.a7_gtp  import A7_1000BASEX
 from liteeth.phy.serial.basex.wrappers.a7_gtp  import A7_2500BASEX
+from liteeth.phy.serial.basex.wrappers.a7_gtp  import A7_5000BASEX
 from liteeth.phy.serial.basex.wrappers.k7_gtx  import K7_1000BASEX
 from liteeth.phy.serial.basex.wrappers.k7_gtx  import K7_2500BASEX
 from liteeth.phy.serial.basex.wrappers.ku_gth  import KU_1000BASEX

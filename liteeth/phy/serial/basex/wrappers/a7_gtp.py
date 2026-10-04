@@ -24,6 +24,7 @@ from liteeth.phy.serial.basex.pma.gtp_7series import PMA_A7_GTP_BASEX
 
 class A7_1000BASEX(LiteXModule):
     dw          = 8
+    gtp_dw      = 20
     linerate    = 1.25e9
     rx_clk_freq = 125e6
     tx_clk_freq = 125e6
@@ -44,7 +45,7 @@ class A7_1000BASEX(LiteXModule):
     ):
         pcs_kwargs = {} if pcs_kwargs is None else dict(pcs_kwargs)
         pcs_kwargs.setdefault("eth_tx_clk_freq", self.tx_clk_freq)
-        self.pcs = pcs = PCS(lsb_first=True, **pcs_kwargs)
+        self.pcs = pcs = PCS(lsb_first=True, dw=self.dw, **pcs_kwargs)
 
         # Optional pipeline cuts at the MAC boundary ease timing closure when
         # the PCS runs at 312.5MHz. The TBI/autonegotiation path is unchanged.
@@ -76,6 +77,7 @@ class A7_1000BASEX(LiteXModule):
             rx_cm_buf_type = rx_cm_buf_type,
             rx_polarity    = rx_polarity,
             tx_polarity    = tx_polarity,
+            gtp_dw         = self.gtp_dw,
             with_channel   = False,
         )
         self.comb += [
@@ -91,14 +93,33 @@ class A7_1000BASEX(LiteXModule):
             "cd_eth_tx", "cd_eth_rx", "cd_eth_tx_half", "cd_eth_rx_half",
             "txoutclk", "rxoutclk", "reset", "gearbox",
             "gtp_params", "tx_cm", "rx_cm", "tx_init", "rx_init",
+            "gtp_clk_freq", "gtp_tx_usrclk_domain", "gtp_rx_usrclk_domain",
+            "gtp_tx_clock_domain", "gtp_rx_clock_domain",
+            "tx_reset_done", "rx_reset_done", "rx_pma_reset_done",
+            # Transceiver diagnostics.
+            "loopback", "tx_prbs_config", "rx_prbs_config", "tx_prbs_force_error",
+            "rx_prbs_counter_reset", "rx_prbs_error", "rx_cdr_lock", "rx_byte_is_aligned",
+            "rx_byte_realign", "rx_comma_detect", "rx_polarity_effective",
         ):
-            object.__setattr__(self, name, getattr(pma, name))
+            # The 40-bit GTP interface runs at the PCS rate and has no gearbox.
+            if hasattr(pma, name):
+                object.__setattr__(self, name, getattr(pma, name))
         if with_csr:
             self.add_csr()
 
     def add_csr(self):
         self._reset = CSRStorage(description="PHY reset.")
         self.comb += self.reset.eq(self._reset.storage)
+
+    def add_timing_constraints(self, platform):
+        """Declare TXOUTCLK/RXOUTCLK at linerate/20 (GTPE2 internal datapath)."""
+        period = "%.3f" % (1e9/self.gtp_clk_freq)
+        platform.add_platform_command(
+            "create_clock -name {txoutclk} -period " + period + " [get_nets {txoutclk}]",
+            txoutclk = self.txoutclk)
+        platform.add_platform_command(
+            "create_clock -name {rxoutclk} -period " + period + " [get_nets {rxoutclk}]",
+            rxoutclk = self.rxoutclk)
 
     def do_finalize(self):
         # Keep this hook for targets that customize gtp_params during finalization.
@@ -110,3 +131,13 @@ class A7_2500BASEX(A7_1000BASEX):
     linerate    = 3.125e9
     rx_clk_freq = 312.5e6
     tx_clk_freq = 312.5e6
+
+# A7_5000BASEX PHY ---------------------------------------------------------------------------------
+
+class A7_5000BASEX(A7_1000BASEX):
+    """Experimental 5Gb/s MAC over a 6.25Gb/s, four-symbol 8b/10b link."""
+    dw          = 32
+    gtp_dw      = 40
+    linerate    = 6.25e9
+    rx_clk_freq = 156.25e6
+    tx_clk_freq = 156.25e6
